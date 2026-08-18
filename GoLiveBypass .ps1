@@ -1,4 +1,4 @@
-﻿# =====================================================================
+# =====================================================================
 #  GoLiveBypass Standalone
 #
 #  Credits:
@@ -96,7 +96,7 @@ function Write-LoaderFiles([string]$LoaderDir) {
     $packageJson = @'
 {
   "name": "golive-bypass-standalone",
-  "version": "4.1.0",
+  "version": "1.0.0",
   "main": "index.js"
 }
 '@
@@ -155,8 +155,6 @@ let watchdog;
 let currentVoiceChannelId = null;
 let voiceReconnectedAfterCycle = false;
 let skipAutomaticProxyThisBoot = false;
-let recoveringBadProxy = false;
-const badProxiesThisBoot = new Set();
 
 function log(message) {
     const line = `[${new Date().toISOString()}] ${message}`;
@@ -347,8 +345,7 @@ async function fetchFreeProxy(protocol, excludedCountries) {
     try {
         proxies = parseFreeProxyList(body)
             .filter(e => !e.countryCode || !excluded.has(e.countryCode))
-            .map(e => e.proxy)
-            .filter(proxy => !badProxiesThisBoot.has(proxy));
+            .map(e => e.proxy);
     } catch {
         return { success: false, error: "Failed to parse the free proxy list." };
     }
@@ -396,32 +393,12 @@ async function prepareProxy() {
 
     preparingProxy = (async () => {
         const stored = readStoredProxy();
-
         if (stored) {
-            const parsed = parseProxy(stored);
-
-            if (parsed) {
-                log(`Verifying stored proxy: ${stored}`);
-
-                const ok = await connectThroughProxy(
-                    parsed.scheme,
-                    parsed.host,
-                    parsed.port,
-                    "discord.com",
-                    443
-                );
-
-                if (ok) {
-                    preparedProxy = stored;
-                    log(`Stored proxy verified READY: ${stored}`);
-                    return stored;
-                }
-
-                log(`Stored proxy failed verification: ${stored}`);
-                badProxiesThisBoot.add(stored);
-            }
-
-            forgetStoredProxy();
+            // Mirrors the original earlyProxy()/earlyApply() behavior:
+            // reuse lastKnownProxy immediately instead of retesting it here.
+            preparedProxy = stored;
+            log(`Stored proxy READY immediately: ${stored}`);
+            return stored;
         }
 
         const result = await fetchFreeProxy(
@@ -502,122 +479,6 @@ async function clearGoLiveBypass(reason, rearm = false) {
     }
 }
 
-async function recoverFromBadProxy(contents, reason, details = "") {
-    if (recoveringBadProxy) return;
-
-    recoveringBadProxy = true;
-    stopWatchdog();
-
-    const badProxy = preparedProxy || readStoredProxy();
-
-    if (badProxy) {
-        badProxiesThisBoot.add(badProxy);
-        log(`BAD PROXY rejected: ${badProxy}`);
-    }
-
-    if (details)
-        log(`Proxy failure details: ${details}`);
-
-    // Never reuse this proxy after a broken proxied page load.
-    preparedProxy = "";
-    preparingProxy = null;
-    forgetStoredProxy();
-    clearLastApply();
-
-    try {
-        log(`Recovering Discord from bad proxy (${reason})...`);
-
-        await session.defaultSession.setProxy({
-            mode: "direct"
-        });
-
-        try {
-            await session.defaultSession.closeAllConnections();
-        } catch {}
-
-        proxyApplied = false;
-        waitingForConnectionOpen = false;
-        reloadNavigationStarted = false;
-
-        log("Bad proxy removed. Direct connection restored.");
-
-        if (contents && !contents.isDestroyed()) {
-            log("Reloading Discord directly...");
-            contents.reload();
-        } else {
-            log("Discord renderer was unavailable during recovery.");
-        }
-
-        // Keep currentVoiceChannelId set. When the direct reload reconnects
-        // to the same call, the call detector recognizes it as the same call
-        // and does not immediately start another proxy cycle.
-
-        setTimeout(() => {
-            if (skipAutomaticProxyThisBoot) return;
-
-            log("Searching for a replacement proxy in background...");
-
-            prepareProxy()
-                .then(proxy => {
-                    if (proxy)
-                        log(`Replacement proxy READY for next call: ${proxy}`);
-                })
-                .catch(e => {
-                    log(`Replacement proxy search failed: ${e.stack || e}`);
-                });
-
-        }, 750);
-
-    } catch (e) {
-        log(`Bad-proxy recovery failed: ${e.stack || e}`);
-    } finally {
-        setTimeout(() => {
-            recoveringBadProxy = false;
-        }, 1500);
-    }
-}
-
-function getFailLoadDetails(args) {
-    // New Electron event style: (event, details)
-    if (
-        args.length >= 2 &&
-        args[1] &&
-        typeof args[1] === "object" &&
-        typeof args[1].errorCode === "number"
-    ) {
-        return {
-            errorCode: args[1].errorCode,
-            errorDescription: args[1].errorDescription || "",
-            validatedURL: args[1].validatedURL || args[1].url || "",
-            isMainFrame: args[1].isMainFrame !== false
-        };
-    }
-
-    // Traditional Electron style:
-    // (event, errorCode, errorDescription, validatedURL, isMainFrame, ...)
-    return {
-        errorCode:
-            typeof args[1] === "number"
-                ? args[1]
-                : 0,
-
-        errorDescription:
-            typeof args[2] === "string"
-                ? args[2]
-                : "",
-
-        validatedURL:
-            typeof args[3] === "string"
-                ? args[3]
-                : "",
-
-        isMainFrame:
-            args.length < 5
-                ? true
-                : args[4] !== false
-    };
-}
-
 async function switchForCall(contents, channelId) {
     if (switchingForCall || waitingForConnectionOpen || proxyApplied) return;
     switchingForCall = true;
@@ -696,42 +557,6 @@ function extractVoiceChannelId(message) {
 }
 
 function attachDiscordEvents(contents) {
-    const handleLoadFailure = (...args) => {
-        if (
-            !proxyApplied ||
-            !waitingForConnectionOpen ||
-            recoveringBadProxy
-        ) return;
-
-        const failure = getFailLoadDetails(args);
-
-        // ERR_ABORTED (-3) is normal while a navigation/reload is being
-        // replaced. Other main-frame failures during the proxy window are
-        // treated as a bad proxy.
-        if (
-            !failure.isMainFrame ||
-            failure.errorCode === -3
-        ) return;
-
-        const detail =
-            `${failure.errorDescription || "load error"} ` +
-            `(${failure.errorCode}) ` +
-            `${failure.validatedURL || ""}`.trim();
-
-        log(`Proxied Discord load failed: ${detail}`);
-
-        recoverFromBadProxy(
-            contents,
-            "proxied load failed",
-            detail
-        ).catch(e => {
-            log(`Recovery handler error: ${e.stack || e}`);
-        });
-    };
-
-    contents.on("did-fail-load", handleLoadFailure);
-    contents.on("did-fail-provisional-load", handleLoadFailure);
-
     contents.on("console-message", (...args) => {
         const message = getConsoleMessage(args);
         if (!message) return;
@@ -839,7 +664,7 @@ function Install-IntoDiscord([System.IO.DirectoryInfo]$AppDir) {
     if ((Test-Path $backupAsar) -and (Test-IsOurLoader $loaderDir)) {
         Write-Host "  [*] GoLiveBypass existente detectado; atualizando loader..." -ForegroundColor DarkGray
         Write-LoaderFiles $loaderDir
-        Write-Host "  [OK] Loader V4.1 atualizado em $($AppDir.Name)." -ForegroundColor Green
+        Write-Host "  [OK] Loader atualizado em $($AppDir.Name)." -ForegroundColor Green
         return
     }
 
@@ -862,7 +687,7 @@ function Install-IntoDiscord([System.IO.DirectoryInfo]$AppDir) {
 
     Write-LoaderFiles $loaderDir
 
-    Write-Host "  [OK] Loader V4.1 instalado em $($AppDir.Name)." -ForegroundColor Green
+    Write-Host "  [OK] Loader instalado em $($AppDir.Name)." -ForegroundColor Green
 }
 
 function Restore-App([System.IO.DirectoryInfo]$AppDir) {
@@ -913,7 +738,7 @@ function New-GoLiveShortcut([string]$Path) {
     $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PermanentScript`" -Mode PermanentRun"
     $shortcut.WorkingDirectory = $InstallRoot
     $shortcut.IconLocation = (Join-Path (Get-LatestDiscordApp).FullName "Discord.exe")
-    $shortcut.Description = "Discord com GoLiveBypass Standalone v4.1.1"
+    $shortcut.Description = "Discord com GoLiveBypass Standalone"
     $shortcut.Save()
 }
 

@@ -127,13 +127,13 @@ const path = require("path");
 const { app, session } = require("electron");
 const { request } = require("https");
 const { connect } = require("net");
+const { connect: tlsConnect } = require("tls");
 
 const FREE_PROXY_API = "https://api.proxyscrape.com/v4/free-proxy-list/get";
 const MAX_LIST_BYTES = 1024 * 1024;
 const MAX_PROXY_CANDIDATES = 8;
 const PROXY_TEST_TIMEOUT_MS = 5000;
 const WATCHDOG_TIMEOUT_MS = 120_000;
-const LAST_APPLY_GRACE_MS = 3 * 60_000;
 const VALID_PROTOCOLS = new Set(["http", "socks4", "socks5"]);
 const PROXY_RULES_RE = /^(socks4|socks5|https?):\/\/([^/\s]{1,253}):(\d{1,5})$/;
 
@@ -154,7 +154,7 @@ let clearInProgress = false;
 let watchdog;
 let currentVoiceChannelId = null;
 let voiceReconnectedAfterCycle = false;
-let skipAutomaticProxyThisBoot = false;
+let recoveringFailedLoad = false;
 
 function log(message) {
     const line = `[${new Date().toISOString()}] ${message}`;
@@ -222,58 +222,189 @@ function parseProxy(proxyRules) {
 function connectThroughProxy(scheme, host, port, target, targetPort) {
     return new Promise(resolve => {
         const socket = connect({ host, port });
+        let activeSocket = socket;
         let settled = false;
-
-        // socket.setTimeout() is an inactivity timeout. Keep the original
-        // behavior, but also enforce the intended 5-second wall-clock limit.
-        const hardDeadline = setTimeout(
-            () => done(false),
-            PROXY_TEST_TIMEOUT_MS
-        );
 
         const done = ok => {
             if (settled) return;
             settled = true;
             clearTimeout(hardDeadline);
-            try { socket.destroy(); } catch {}
+            try { activeSocket.destroy(); } catch {}
+            if (activeSocket !== socket) {
+                try { socket.destroy(); } catch {}
+            }
             resolve(ok);
         };
 
-        socket.setTimeout(PROXY_TEST_TIMEOUT_MS, () => done(false));
-        socket.on("error", () => done(false));
+        // One hard deadline for TCP + proxy handshake + TLS verification.
+        const hardDeadline = setTimeout(
+            () => done(false),
+            PROXY_TEST_TIMEOUT_MS
+        );
+
+        const validateTls = () => {
+            if (settled) return;
+
+            try {
+                // A TCP/SOCKS tunnel being open is NOT enough. A number of
+                // public proxies accept the tunnel but then break/intercept
+                // HTTPS, which produces ERR_CERT_AUTHORITY_INVALID in Discord.
+                //
+                // Require a real, trusted TLS handshake for discord.com before
+                // considering the proxy usable.
+                const tlsSocket = tlsConnect({
+                    socket,
+                    servername: target,
+                    rejectUnauthorized: true,
+                    ALPNProtocols: ["http/1.1"]
+                });
+
+                activeSocket = tlsSocket;
+
+                tlsSocket.setTimeout(
+                    PROXY_TEST_TIMEOUT_MS,
+                    () => done(false)
+                );
+
+                tlsSocket.once("error", () => done(false));
+
+                tlsSocket.once("secureConnect", () => {
+                    const cert = tlsSocket.getPeerCertificate();
+                    const hasCertificate =
+                        cert &&
+                        typeof cert === "object" &&
+                        Object.keys(cert).length > 0;
+
+                    done(
+                        tlsSocket.authorized === true &&
+                        hasCertificate
+                    );
+                });
+            } catch {
+                done(false);
+            }
+        };
+
+        socket.setTimeout(
+            PROXY_TEST_TIMEOUT_MS,
+            () => done(false)
+        );
+
+        socket.once("error", () => done(false));
 
         socket.once("connect", () => {
             if (scheme === "http" || scheme === "https") {
-                socket.once("data", res => done(/^HTTP\/1\.[01] 200/.test(res.toString("latin1"))));
-                socket.write(`CONNECT ${target}:${targetPort} HTTP/1.1\r\nHost: ${target}:${targetPort}\r\n\r\n`);
+                let response = Buffer.alloc(0);
+
+                const onData = chunk => {
+                    response = Buffer.concat([response, chunk]);
+
+                    if (response.length > 16 * 1024) {
+                        socket.off("data", onData);
+                        return done(false);
+                    }
+
+                    const text = response.toString("latin1");
+                    if (!text.includes("\r\n\r\n"))
+                        return;
+
+                    socket.off("data", onData);
+
+                    if (!/^HTTP\/1\.[01] 200\b/.test(text))
+                        return done(false);
+
+                    validateTls();
+                };
+
+                socket.on("data", onData);
+                socket.write(
+                    `CONNECT ${target}:${targetPort} HTTP/1.1\r\n` +
+                    `Host: ${target}:${targetPort}\r\n` +
+                    `Proxy-Connection: keep-alive\r\n\r\n`
+                );
                 return;
             }
 
             if (scheme === "socks5") {
                 socket.once("data", greeting => {
-                    if (greeting.length < 2 || greeting[1] !== 0) return done(false);
+                    if (
+                        greeting.length < 2 ||
+                        greeting[0] !== 0x05 ||
+                        greeting[1] !== 0x00
+                    ) {
+                        return done(false);
+                    }
 
                     const hostBuf = Buffer.from(target, "latin1");
-                    socket.once("data", res => done(res.length >= 2 && res[1] === 0));
+
+                    socket.once("data", res => {
+                        if (
+                            res.length < 2 ||
+                            res[0] !== 0x05 ||
+                            res[1] !== 0x00
+                        ) {
+                            return done(false);
+                        }
+
+                        validateTls();
+                    });
+
                     socket.write(Buffer.concat([
-                        Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuf.length]),
+                        Buffer.from([
+                            0x05, 0x01, 0x00, 0x03, hostBuf.length
+                        ]),
                         hostBuf,
-                        Buffer.from([targetPort >> 8, targetPort & 0xff])
+                        Buffer.from([
+                            targetPort >> 8,
+                            targetPort & 0xff
+                        ])
                     ]));
                 });
+
                 socket.write(Buffer.from([0x05, 0x01, 0x00]));
                 return;
             }
 
             const hostBuf = Buffer.from(target, "latin1");
-            socket.once("data", res => done(res.length >= 2 && res[1] === 0x5a));
+
+            socket.once("data", res => {
+                if (
+                    res.length < 2 ||
+                    res[1] !== 0x5a
+                ) {
+                    return done(false);
+                }
+
+                validateTls();
+            });
+
             socket.write(Buffer.concat([
-                Buffer.from([0x04, 0x01, targetPort >> 8, targetPort & 0xff, 0, 0, 0, 1, 0]),
+                Buffer.from([
+                    0x04,
+                    0x01,
+                    targetPort >> 8,
+                    targetPort & 0xff,
+                    0, 0, 0, 1,
+                    0
+                ]),
                 hostBuf,
                 Buffer.from([0])
             ]));
         });
     });
+}
+
+async function verifyProxy(proxy) {
+    const parsed = parseProxy(proxy);
+    if (!parsed) return false;
+
+    return connectThroughProxy(
+        parsed.scheme,
+        parsed.host,
+        parsed.port,
+        "discord.com",
+        443
+    );
 }
 
 function downloadText(url) {
@@ -364,9 +495,9 @@ async function fetchFreeProxy(protocol, excludedCountries) {
         const parsed = parseProxy(candidate);
         if (!parsed) continue;
 
-        log(`Testing ${candidate}`);
+        log(`Testing HTTPS/TLS ${candidate}`);
         if (await connectThroughProxy(parsed.scheme, parsed.host, parsed.port, "discord.com", 443)) {
-            log(`Working proxy found: ${candidate}`);
+            log(`HTTPS-safe proxy found: ${candidate}`);
             return { success: true, proxy: candidate };
         }
         log(`Proxy failed: ${candidate}`);
@@ -375,30 +506,78 @@ async function fetchFreeProxy(protocol, excludedCountries) {
     return { success: false, error: "No working proxy found outside the excluded countries." };
 }
 
-async function prepareProxy() {
-    const manual = typeof settings.proxy === "string" ? settings.proxy.trim() : "";
+async function prepareProxy(forceVerify = false) {
+    const manual =
+        typeof settings.proxy === "string"
+            ? settings.proxy.trim()
+            : "";
 
     if (manual) {
         if (!parseProxy(manual)) {
             log("Configured manual proxy is invalid.");
             return "";
         }
+
+        if (forceVerify) {
+            log(`Verifying manual proxy with HTTPS/TLS: ${manual}`);
+
+            if (!await verifyProxy(manual)) {
+                log(`Manual proxy failed HTTPS/TLS verification: ${manual}`);
+                return "";
+            }
+
+            log(`Manual proxy verified: ${manual}`);
+        }
+
         preparedProxy = manual;
         return manual;
     }
 
-    if (skipAutomaticProxyThisBoot) return "";
-    if (preparedProxy && parseProxy(preparedProxy)) return preparedProxy;
-    if (preparingProxy) return preparingProxy;
+    // If a background search is already running, wait for it. Any proxy
+    // returned by fetchFreeProxy has already passed the full TLS test.
+    if (preparingProxy)
+        return preparingProxy;
+
+    // Before actually using an already-prepared proxy in a call, test it
+    // again. Public proxies can die between Discord startup and call entry.
+    if (
+        preparedProxy &&
+        parseProxy(preparedProxy)
+    ) {
+        if (!forceVerify)
+            return preparedProxy;
+
+        const current = preparedProxy;
+
+        log(`Rechecking proxy before call with HTTPS/TLS: ${current}`);
+
+        if (await verifyProxy(current)) {
+            log(`Proxy verified for call: ${current}`);
+            return current;
+        }
+
+        log(`Prepared proxy is no longer usable: ${current}`);
+
+        preparedProxy = "";
+
+        if (readStoredProxy() === current)
+            forgetStoredProxy();
+    }
 
     preparingProxy = (async () => {
         const stored = readStoredProxy();
+
         if (stored) {
-            // Mirrors the original earlyProxy()/earlyApply() behavior:
-            // reuse lastKnownProxy immediately instead of retesting it here.
-            preparedProxy = stored;
-            log(`Stored proxy READY immediately: ${stored}`);
-            return stored;
+            log(`Verifying stored proxy with HTTPS/TLS: ${stored}`);
+
+            if (await verifyProxy(stored)) {
+                preparedProxy = stored;
+                log(`Stored proxy verified READY: ${stored}`);
+                return stored;
+            }
+
+            log(`Stored proxy rejected by HTTPS/TLS test: ${stored}`);
+            forgetStoredProxy();
         }
 
         const result = await fetchFreeProxy(
@@ -491,7 +670,7 @@ async function switchForCall(contents, channelId) {
         if (preparingProxy && !preparedProxy)
             log("Proxy is still being prepared; call trigger is waiting for it.");
 
-        const proxy = await prepareProxy();
+        const proxy = await prepareProxy(true);
         if (!proxy) {
             log("No proxy available for call refresh.");
             currentVoiceChannelId = null;
@@ -539,6 +718,102 @@ async function switchForCall(contents, channelId) {
     }
 }
 
+function getLoadFailure(args) {
+    // Current-style details object, if Electron supplies one.
+    if (
+        args.length >= 2 &&
+        args[1] &&
+        typeof args[1] === "object" &&
+        typeof args[1].errorCode === "number"
+    ) {
+        return {
+            errorCode: args[1].errorCode,
+            errorDescription: args[1].errorDescription || "",
+            validatedURL: args[1].validatedURL || args[1].url || "",
+            isMainFrame: args[1].isMainFrame !== false
+        };
+    }
+
+    // Traditional Electron signature:
+    // (event, errorCode, errorDescription, validatedURL, isMainFrame, ...)
+    return {
+        errorCode:
+            typeof args[1] === "number"
+                ? args[1]
+                : 0,
+
+        errorDescription:
+            typeof args[2] === "string"
+                ? args[2]
+                : "",
+
+        validatedURL:
+            typeof args[3] === "string"
+                ? args[3]
+                : "",
+
+        isMainFrame:
+            args.length < 5
+                ? true
+                : args[4] !== false
+    };
+}
+
+async function recoverFailedProxyPage(contents, failure) {
+    if (recoveringFailedLoad)
+        return;
+
+    recoveringFailedLoad = true;
+
+    const badProxy = preparedProxy || readStoredProxy();
+
+    try {
+        log(
+            `Proxy page load failed: ` +
+            `${failure.errorDescription || "load error"} ` +
+            `(${failure.errorCode})`
+        );
+
+        if (badProxy)
+            log(`Discarding bad proxy: ${badProxy}`);
+
+        preparedProxy = "";
+
+        if (
+            badProxy &&
+            readStoredProxy() === badProxy
+        ) {
+            forgetStoredProxy();
+        }
+
+        // Restore DIRECT only. Do not select/retry another proxy in the
+        // current call. This keeps the old successful flow while preventing
+        // a dead gray Discord window.
+        await clearGoLiveBypass(
+            "proxy page load failed",
+            false
+        );
+
+        try {
+            await session.defaultSession.closeAllConnections();
+        } catch {}
+
+        if (
+            contents &&
+            !contents.isDestroyed()
+        ) {
+            log("Reloading Discord directly after proxy failure...");
+            contents.reload();
+        }
+    } catch (e) {
+        log(`Failed recovering proxy page load: ${e.stack || e}`);
+    } finally {
+        setTimeout(() => {
+            recoveringFailedLoad = false;
+        }, 1500);
+    }
+}
+
 function getConsoleMessage(args) {
     // Current Electron: (event, details)
     if (args.length >= 2 && args[1] && typeof args[1] === "object" && typeof args[1].message === "string")
@@ -557,6 +832,36 @@ function extractVoiceChannelId(message) {
 }
 
 function attachDiscordEvents(contents) {
+    const onFailedLoad = (...args) => {
+        if (
+            !proxyApplied ||
+            !waitingForConnectionOpen ||
+            recoveringFailedLoad
+        ) {
+            return;
+        }
+
+        const failure = getLoadFailure(args);
+
+        // ERR_ABORTED (-3) is expected when one navigation replaces another.
+        if (
+            !failure.isMainFrame ||
+            failure.errorCode === -3
+        ) {
+            return;
+        }
+
+        recoverFailedProxyPage(
+            contents,
+            failure
+        ).catch(e => {
+            log(`Proxy failure recovery error: ${e.stack || e}`);
+        });
+    };
+
+    contents.on("did-fail-provisional-load", onFailedLoad);
+    contents.on("did-fail-load", onFailedLoad);
+
     contents.on("console-message", (...args) => {
         const message = getConsoleMessage(args);
         if (!message) return;
@@ -621,15 +926,11 @@ app.on("web-contents-created", (_event, contents) => {
     attachDiscordEvents(contents);
 });
 
-// Preserve the original grace behavior after an unfinished proxied attempt.
-const manual = typeof settings.proxy === "string" ? settings.proxy.trim() : "";
-if (!manual) {
-    const lastApply = typeof state.lastApply === "number" ? state.lastApply : 0;
-    if (lastApply && Date.now() - lastApply < LAST_APPLY_GRACE_MS) {
-        clearLastApply();
-        skipAutomaticProxyThisBoot = true;
-        log("Previous proxied attempt did not finish. Automatic proxy preparation skipped for this boot.");
-    }
+// A previous crash/forced close may leave only a stale marker in our JSON.
+// Never skip proxy preparation because of it: clear the marker and continue.
+if (typeof state.lastApply === "number") {
+    clearLastApply();
+    log("Cleared stale previous proxy-attempt marker.");
 }
 
 log("Loading Discord normally (direct connection)...");
@@ -637,8 +938,6 @@ require(originalMain);
 log("Discord original loaded.");
 
 app.whenReady().then(() => {
-    if (skipAutomaticProxyThisBoot) return;
-
     log("Preparing proxy in background...");
     prepareProxy().catch(e => log(`Background proxy preparation failed: ${e.stack || e}`));
 });
